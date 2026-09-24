@@ -91,43 +91,59 @@ class Summarizer:
     def _call_llm(self, client: OpenAI, model: str,
                   title: str, content: str) -> str:
         t0 = time.time()
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    # 注意：这里的 1:7 与 system prompt 中声称的 1:8 不一致是有意为之
-                    # （给模型一个略偏长的信号修正其实际输出偏短的倾向），勿"修复"。
-                    "content": f"以下是课程《{title}》的录音文本，根据长度，你应该输出的字符数大约为{len(content) // 7}字，请开始总结：\n\n{content}",
+                    "content": (
+                        f"以下是课程《{title}》的录音文本，根据长度，"
+                        f"你应该输出的字符数大约为{len(content) // 7}字，"
+                        f"请开始总结：\n\n{content}"
+                    ),
                 },
             ],
-            # temperature=0.3,
+            stream=True,
             timeout=180,
         )
-        if not response.choices:
-            raise ValueError("API returned empty choices — likely content filter or quota exceeded")
-        result = response.choices[0].message.content
+
+        parts: list[str] = []
+        received_chars = 0
+        reported_chars = 0
+
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            text = getattr(delta, "content", None)
+            if not text:
+                continue
+
+            parts.append(text)
+            received_chars += len(text)
+
+            if received_chars - reported_chars >= 1000:
+                print(
+                    f"[Summarizer] Streaming ({model}): "
+                    f"{received_chars} chars received",
+                    flush=True,
+                )
+                reported_chars = received_chars
+
+        result = "".join(parts)
+        if not result.strip():
+            raise ValueError(
+                "Streaming API returned no text — expected "
+                "OpenAI-compatible Chat Completions SSE chunks"
+            )
+
         elapsed = time.time() - t0
-        # Token usage helps explain run cost — every provider's billing is
-        # token-based, and rate-limit decisions key off prompt size much
-        # more than character count.  Some providers (OpenAI-compatible)
-        # leave usage None on streaming or error paths, so fall back to a
-        # plain "no usage" line so the summary still prints.
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            print(
-                f"[Summarizer] Done ({model}): "
-                f"{len(content)} chars input → {len(result)} chars output"
-                f" in {elapsed:.0f}s "
-                f"(tokens: prompt={getattr(usage,'prompt_tokens','?')}, "
-                f"completion={getattr(usage,'completion_tokens','?')})"
-            )
-        else:
-            print(
-                f"[Summarizer] Done ({model}): {len(content)} chars input"
-                f" → {len(result)} chars output in {elapsed:.0f}s"
-            )
+        print(
+            f"[Summarizer] Done ({model}): {len(content)} chars input"
+            f" → {len(result)} chars output in {elapsed:.0f}s (streamed)"
+        )
         return result
 
     def summarize(self, title: str, content: str) -> tuple[str, str]:
